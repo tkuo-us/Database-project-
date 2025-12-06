@@ -146,6 +146,9 @@ def show_dashboard():
     total_spent = spending['total_spent'] if spending['total_spent'] else 0
     total_orders = spending['total_orders'] if spending['total_orders'] else 0
     
+    # Get inventory summary
+    inv_summary = db.get_inventory_summary(st.session_state.user_id)
+    
     # Metrics row
     col1, col2, col3, col4 = st.columns(4)
     
@@ -157,9 +160,101 @@ def show_dashboard():
         avg_order = total_spent / total_orders if total_orders > 0 else 0
         st.metric("📈 Avg Order Value", f"${avg_order:.2f}")
     with col4:
-        shopping_lists = db.get_user_shopping_lists(st.session_state.user_id)
-        active_lists = sum(1 for sl in shopping_lists if sl['is_active'])
-        st.metric("📝 Active Lists", active_lists)
+        inventory_count = inv_summary['total_items'] if inv_summary and inv_summary['total_items'] else 0
+        st.metric("🏠 Inventory Items", inventory_count)
+    
+    st.divider()
+    
+    # Alerts Section - Expiring, Low Stock, Out of Stock
+    st.markdown("### ⚠️ Alerts & Notifications")
+    
+    alert_col1, alert_col2, alert_col3 = st.columns(3)
+    
+    # Items Expiring Soon (Within 7 Days)
+    with alert_col1:
+        expiring_items = db.get_expiring_soon(st.session_state.user_id, days=7)
+        expired_items = db.get_expired_items(st.session_state.user_id)
+        
+        if expired_items:
+            st.error(f"🚨 **{len(expired_items)} Expired Items**")
+            for item in expired_items[:5]:
+                days_exp = int(item['days_expired']) if item['days_expired'] else 0
+                st.markdown(f"- ❌ **{item['product_name']}** - Expired {days_exp} days ago")
+            if len(expired_items) > 5:
+                st.caption(f"... and {len(expired_items) - 5} more")
+        
+        if expiring_items:
+            st.warning(f"⏰ **{len(expiring_items)} Items Expiring Soon**")
+            for item in expiring_items[:5]:
+                days_left = int(item['days_until_expiry']) if item['days_until_expiry'] else 0
+                if days_left == 0:
+                    st.markdown(f"- 🔴 **{item['product_name']}** - Expires TODAY!")
+                elif days_left == 1:
+                    st.markdown(f"- 🟠 **{item['product_name']}** - Expires tomorrow")
+                else:
+                    st.markdown(f"- 🟡 **{item['product_name']}** - {days_left} days left")
+            if len(expiring_items) > 5:
+                st.caption(f"... and {len(expiring_items) - 5} more")
+        
+        if not expired_items and not expiring_items:
+            st.success("✅ No items expiring soon!")
+    
+    # Low Stock Items
+    with alert_col2:
+        low_stock = db.get_low_stock_items(st.session_state.user_id)
+        
+        if low_stock:
+            st.warning(f"📉 **{len(low_stock)} Items Running Low**")
+            for item in low_stock[:5]:
+                st.markdown(f"- **{item['product_name']}** - Only {item['quantity']} {item['unit_measure']} left")
+            if len(low_stock) > 5:
+                st.caption(f"... and {len(low_stock) - 5} more")
+        else:
+            st.success("✅ All items well stocked!")
+    
+    # Out of Stock Items
+    with alert_col3:
+        out_of_stock = db.get_out_of_stock_items(st.session_state.user_id)
+        
+        if out_of_stock:
+            st.error(f"🚫 **{len(out_of_stock)} Items Out of Stock**")
+            for item in out_of_stock[:5]:
+                st.markdown(f"- **{item['product_name']}** ({item['brand']})")
+            if len(out_of_stock) > 5:
+                st.caption(f"... and {len(out_of_stock) - 5} more")
+        else:
+            st.success("✅ Nothing out of stock!")
+    
+    st.divider()
+    
+    # Current Inventory Overview
+    st.markdown("### 🏠 Current Inventory Overview")
+    
+    inv_col1, inv_col2 = st.columns(2)
+    
+    with inv_col1:
+        st.subheader("📍 Inventory by Location")
+        inv_by_location = db.get_inventory_by_location(st.session_state.user_id)
+        if inv_by_location:
+            df = pd.DataFrame([dict(row) for row in inv_by_location])
+            fig = px.pie(df, values='total_quantity', names='location',
+                        hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No inventory data yet. Add items to your inventory!")
+    
+    with inv_col2:
+        st.subheader("📦 Inventory by Category")
+        inv_by_category = db.get_inventory_by_category(st.session_state.user_id)
+        if inv_by_category:
+            df = pd.DataFrame([dict(row) for row in inv_by_category])
+            fig = px.bar(df, x='category_name', y='total_quantity',
+                        color='item_count', text='total_quantity',
+                        labels={'category_name': 'Category', 'total_quantity': 'Total Qty', 'item_count': 'Items'})
+            fig.update_traces(textposition='outside')
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No inventory data yet.")
     
     st.divider()
     
@@ -620,6 +715,203 @@ def show_reports_page():
     else:
         st.info("No data for the last 7 days.")
 
+# ==================== INVENTORY MANAGEMENT ====================
+
+def show_inventory_page():
+    """Display inventory management page"""
+    st.markdown("## 🏠 Inventory Management")
+    
+    tab1, tab2, tab3 = st.tabs(["📦 Current Inventory", "➕ Add to Inventory", "⚠️ Alerts"])
+    
+    with tab1:
+        # Filter options
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            search = st.text_input("🔍 Search inventory", placeholder="Search by product name...")
+        with col2:
+            location_filter = st.selectbox("Filter by Location", 
+                ["All Locations", "Pantry", "Refrigerator", "Freezer", "Cabinet", "Other"])
+        
+        # Get inventory
+        inventory = db.get_user_inventory(st.session_state.user_id)
+        
+        if inventory:
+            # Apply filters
+            filtered_inv = [dict(item) for item in inventory]
+            if search:
+                filtered_inv = [i for i in filtered_inv if search.lower() in i['product_name'].lower()]
+            if location_filter != "All Locations":
+                filtered_inv = [i for i in filtered_inv if i['location'] == location_filter]
+            
+            if filtered_inv:
+                # Display as table
+                df = pd.DataFrame(filtered_inv)
+                display_cols = ['product_name', 'brand', 'category_name', 'quantity', 'unit_measure', 
+                               'min_quantity', 'expiry_date', 'location']
+                df_display = df[display_cols].copy()
+                df_display.columns = ['Product', 'Brand', 'Category', 'Qty', 'Unit', 'Min Qty', 'Expiry', 'Location']
+                
+                st.dataframe(df_display, use_container_width=True, hide_index=True)
+                
+                # Edit inventory item
+                st.subheader("Edit Inventory Item")
+                inv_options = {f"{i['product_name']} ({i['location']})": i['inventory_id'] for i in filtered_inv}
+                selected_inv = st.selectbox("Select item to edit", list(inv_options.keys()))
+                
+                if selected_inv:
+                    inv_id = inv_options[selected_inv]
+                    item = next(i for i in filtered_inv if i['inventory_id'] == inv_id)
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        new_qty = st.number_input("Quantity", value=item['quantity'], min_value=0)
+                        new_min = st.number_input("Min Quantity", value=item['min_quantity'] or 2, min_value=0)
+                    with col2:
+                        new_expiry = st.date_input("Expiry Date", 
+                            value=datetime.strptime(item['expiry_date'], '%Y-%m-%d').date() if item['expiry_date'] else None)
+                        new_location = st.selectbox("Location", 
+                            ["Pantry", "Refrigerator", "Freezer", "Cabinet", "Other"],
+                            index=["Pantry", "Refrigerator", "Freezer", "Cabinet", "Other"].index(item['location']) if item['location'] in ["Pantry", "Refrigerator", "Freezer", "Cabinet", "Other"] else 0)
+                    with col3:
+                        new_notes = st.text_area("Notes", value=item['notes'] or '')
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        if st.button("💾 Update Item", use_container_width=True):
+                            db.update_inventory_item(inv_id, new_qty, new_min, 
+                                new_expiry.isoformat() if new_expiry else None, new_location, new_notes)
+                            st.success("Item updated!")
+                            st.rerun()
+                    with col2:
+                        use_qty = st.number_input("Use quantity", min_value=1, value=1, key="use_qty")
+                    with col3:
+                        if st.button("📉 Use Item", use_container_width=True):
+                            db.use_inventory_item(inv_id, use_qty)
+                            st.success(f"Used {use_qty} {item['unit_measure']}!")
+                            st.rerun()
+                    
+                    if st.button("🗑️ Remove from Inventory", type="secondary"):
+                        db.delete_inventory_item(inv_id)
+                        st.success("Item removed!")
+                        st.rerun()
+            else:
+                st.info("No items match your search/filter.")
+        else:
+            st.info("Your inventory is empty. Add items to start tracking!")
+    
+    with tab2:
+        st.subheader("Add Item to Inventory")
+        
+        products = db.get_all_products()
+        if products:
+            with st.form("add_inventory_form"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    product_options = {f"{p['product_name']} - {p['brand']}": p['product_id'] for p in products}
+                    selected_product = st.selectbox("Select Product", list(product_options.keys()))
+                    quantity = st.number_input("Quantity", min_value=1, value=1)
+                    min_quantity = st.number_input("Minimum Quantity (for low stock alerts)", min_value=0, value=2)
+                with col2:
+                    expiry_date = st.date_input("Expiry Date (optional)", value=None)
+                    location = st.selectbox("Storage Location", 
+                        ["Pantry", "Refrigerator", "Freezer", "Cabinet", "Other"])
+                    notes = st.text_input("Notes (optional)")
+                
+                if st.form_submit_button("➕ Add to Inventory", use_container_width=True):
+                    product_id = product_options[selected_product]
+                    db.add_to_inventory(
+                        st.session_state.user_id, 
+                        product_id, 
+                        quantity,
+                        expiry_date.isoformat() if expiry_date else None,
+                        location,
+                        min_quantity,
+                        notes
+                    )
+                    st.success(f"Added {quantity} x {selected_product.split(' - ')[0]} to inventory!")
+                    st.rerun()
+        else:
+            st.warning("No products available. Please add products first!")
+    
+    with tab3:
+        st.subheader("⚠️ Inventory Alerts")
+        
+        # Summary metrics
+        inv_summary = db.get_inventory_summary(st.session_state.user_id)
+        if inv_summary:
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("⏰ Expiring Soon", inv_summary['expiring_soon_count'] or 0)
+            with col2:
+                st.metric("❌ Expired", inv_summary['expired_count'] or 0)
+            with col3:
+                st.metric("📉 Low Stock", inv_summary['low_stock_count'] or 0)
+            with col4:
+                st.metric("🚫 Out of Stock", inv_summary['out_of_stock_count'] or 0)
+        
+        st.divider()
+        
+        # Expired Items
+        st.markdown("### ❌ Expired Items")
+        expired = db.get_expired_items(st.session_state.user_id)
+        if expired:
+            df = pd.DataFrame([dict(i) for i in expired])
+            df['days_expired'] = df['days_expired'].astype(int)
+            df_display = df[['product_name', 'brand', 'quantity', 'unit_measure', 'expiry_date', 'days_expired', 'location']]
+            df_display.columns = ['Product', 'Brand', 'Qty', 'Unit', 'Expiry Date', 'Days Expired', 'Location']
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
+        else:
+            st.success("No expired items! 🎉")
+        
+        # Expiring Soon
+        st.markdown("### ⏰ Expiring Within 7 Days")
+        expiring = db.get_expiring_soon(st.session_state.user_id, days=7)
+        if expiring:
+            df = pd.DataFrame([dict(i) for i in expiring])
+            df['days_until_expiry'] = df['days_until_expiry'].astype(int)
+            df_display = df[['product_name', 'brand', 'quantity', 'unit_measure', 'expiry_date', 'days_until_expiry', 'location']]
+            df_display.columns = ['Product', 'Brand', 'Qty', 'Unit', 'Expiry Date', 'Days Left', 'Location']
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
+        else:
+            st.success("No items expiring soon! 🎉")
+        
+        # Low Stock
+        st.markdown("### 📉 Low Stock Items")
+        low_stock = db.get_low_stock_items(st.session_state.user_id)
+        if low_stock:
+            df = pd.DataFrame([dict(i) for i in low_stock])
+            df_display = df[['product_name', 'brand', 'quantity', 'min_quantity', 'unit_measure', 'location']]
+            df_display.columns = ['Product', 'Brand', 'Current Qty', 'Min Qty', 'Unit', 'Location']
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
+            
+            # Quick add to shopping list
+            if st.button("📝 Add All Low Stock Items to Shopping List"):
+                lists = db.get_user_shopping_lists(st.session_state.user_id)
+                active_lists = [l for l in lists if l['is_active']]
+                if active_lists:
+                    for item in low_stock:
+                        db.add_item_to_shopping_list(active_lists[0]['list_id'], item['product_id'], item['min_quantity'] - item['quantity'] + 1)
+                    st.success(f"Added {len(low_stock)} items to '{active_lists[0]['list_name']}'!")
+                else:
+                    list_id = db.create_shopping_list(st.session_state.user_id, "Restock List")
+                    for item in low_stock:
+                        db.add_item_to_shopping_list(list_id, item['product_id'], item['min_quantity'] - item['quantity'] + 1)
+                    st.success(f"Created 'Restock List' with {len(low_stock)} items!")
+                st.rerun()
+        else:
+            st.success("All items are well stocked! 🎉")
+        
+        # Out of Stock
+        st.markdown("### 🚫 Out of Stock Items")
+        out_of_stock = db.get_out_of_stock_items(st.session_state.user_id)
+        if out_of_stock:
+            df = pd.DataFrame([dict(i) for i in out_of_stock])
+            df_display = df[['product_name', 'brand', 'category_name', 'unit_price']]
+            df_display.columns = ['Product', 'Brand', 'Category', 'Price ($)']
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
+        else:
+            st.success("Nothing is out of stock! 🎉")
+
 # ==================== MAIN APPLICATION ====================
 
 def main():
@@ -634,7 +926,7 @@ def main():
             
             menu = st.radio(
                 "Navigation",
-                ["📊 Dashboard", "📦 Products", "📝 Shopping Lists", "🛒 Orders", "📈 Reports"],
+                ["📊 Dashboard", "📦 Products", "🏠 Inventory", "📝 Shopping Lists", "🛒 Orders", "📈 Reports"],
                 label_visibility="collapsed"
             )
             
@@ -651,6 +943,8 @@ def main():
             show_dashboard()
         elif menu == "📦 Products":
             show_products_page()
+        elif menu == "🏠 Inventory":
+            show_inventory_page()
         elif menu == "📝 Shopping Lists":
             show_shopping_lists_page()
         elif menu == "🛒 Orders":

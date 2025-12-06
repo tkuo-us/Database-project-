@@ -117,12 +117,33 @@ def init_database():
             )
         ''')
         
+        # Inventory table - tracks stock and expiry dates
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS inventory (
+                inventory_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                min_quantity INTEGER DEFAULT 2,
+                expiry_date DATE,
+                purchase_date DATE DEFAULT CURRENT_DATE,
+                location VARCHAR(50) DEFAULT 'Pantry',
+                notes TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+                    ON UPDATE CASCADE ON DELETE CASCADE,
+                FOREIGN KEY (product_id) REFERENCES products(product_id)
+                    ON UPDATE CASCADE ON DELETE RESTRICT
+            )
+        ''')
+        
         # Create indexes for better query performance
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(order_date)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_order_details_order ON order_details(order_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_order_details_product ON order_details(product_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_inventory_user ON inventory(user_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_inventory_expiry ON inventory(expiry_date)')
         
         conn.commit()
         print("Database initialized successfully!")
@@ -618,6 +639,203 @@ def get_total_spending(user_id):
             WHERE user_id = ? AND status = 'completed'
         ''', (user_id,))
         return cursor.fetchone()
+
+# ==================== INVENTORY OPERATIONS ====================
+
+def add_to_inventory(user_id, product_id, quantity, expiry_date=None, location='Pantry', min_quantity=2, notes=None):
+    """Add item to inventory"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        # Check if product already exists in inventory
+        cursor.execute('''
+            SELECT inventory_id, quantity FROM inventory 
+            WHERE user_id = ? AND product_id = ? AND (expiry_date = ? OR (expiry_date IS NULL AND ? IS NULL))
+        ''', (user_id, product_id, expiry_date, expiry_date))
+        existing = cursor.fetchone()
+        
+        if existing:
+            # Update existing inventory item
+            cursor.execute('''
+                UPDATE inventory SET quantity = quantity + ?, min_quantity = ?, location = ?, notes = ?
+                WHERE inventory_id = ?
+            ''', (quantity, min_quantity, location, notes, existing['inventory_id']))
+        else:
+            # Insert new inventory item
+            cursor.execute('''
+                INSERT INTO inventory (user_id, product_id, quantity, min_quantity, expiry_date, location, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (user_id, product_id, quantity, min_quantity, expiry_date, location, notes))
+        
+        conn.commit()
+        return cursor.lastrowid
+
+def get_user_inventory(user_id):
+    """Get all inventory items for a user"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT i.*, p.product_name, p.brand, p.unit_measure, c.category_name
+            FROM inventory i
+            JOIN products p ON i.product_id = p.product_id
+            JOIN categories c ON p.category_id = c.category_id
+            WHERE i.user_id = ? AND i.quantity > 0
+            ORDER BY c.category_name, p.product_name
+        ''', (user_id,))
+        return cursor.fetchall()
+
+def get_expiring_soon(user_id, days=7):
+    """Get items expiring within specified days"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT i.*, p.product_name, p.brand, p.unit_measure, c.category_name,
+                   julianday(i.expiry_date) - julianday('now') as days_until_expiry
+            FROM inventory i
+            JOIN products p ON i.product_id = p.product_id
+            JOIN categories c ON p.category_id = c.category_id
+            WHERE i.user_id = ? 
+              AND i.quantity > 0
+              AND i.expiry_date IS NOT NULL
+              AND i.expiry_date <= date('now', '+' || ? || ' days')
+              AND i.expiry_date >= date('now')
+            ORDER BY i.expiry_date ASC
+        ''', (user_id, days))
+        return cursor.fetchall()
+
+def get_expired_items(user_id):
+    """Get items that have already expired"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT i.*, p.product_name, p.brand, p.unit_measure, c.category_name,
+                   julianday('now') - julianday(i.expiry_date) as days_expired
+            FROM inventory i
+            JOIN products p ON i.product_id = p.product_id
+            JOIN categories c ON p.category_id = c.category_id
+            WHERE i.user_id = ? 
+              AND i.quantity > 0
+              AND i.expiry_date IS NOT NULL
+              AND i.expiry_date < date('now')
+            ORDER BY i.expiry_date ASC
+        ''', (user_id,))
+        return cursor.fetchall()
+
+def get_low_stock_items(user_id):
+    """Get items that are running low (quantity <= min_quantity)"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT i.*, p.product_name, p.brand, p.unit_measure, p.unit_price, c.category_name
+            FROM inventory i
+            JOIN products p ON i.product_id = p.product_id
+            JOIN categories c ON p.category_id = c.category_id
+            WHERE i.user_id = ? 
+              AND i.quantity <= i.min_quantity
+              AND i.quantity > 0
+            ORDER BY i.quantity ASC
+        ''', (user_id,))
+        return cursor.fetchall()
+
+def get_out_of_stock_items(user_id):
+    """Get items that are out of stock (quantity = 0)"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT i.*, p.product_name, p.brand, p.unit_measure, p.unit_price, c.category_name
+            FROM inventory i
+            JOIN products p ON i.product_id = p.product_id
+            JOIN categories c ON p.category_id = c.category_id
+            WHERE i.user_id = ? AND i.quantity = 0
+            ORDER BY p.product_name
+        ''', (user_id,))
+        return cursor.fetchall()
+
+def update_inventory_quantity(inventory_id, quantity):
+    """Update inventory quantity"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE inventory SET quantity = ? WHERE inventory_id = ?
+        ''', (quantity, inventory_id))
+        conn.commit()
+        return cursor.rowcount > 0
+
+def update_inventory_item(inventory_id, quantity, min_quantity, expiry_date, location, notes):
+    """Update inventory item details"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE inventory 
+            SET quantity = ?, min_quantity = ?, expiry_date = ?, location = ?, notes = ?
+            WHERE inventory_id = ?
+        ''', (quantity, min_quantity, expiry_date, location, notes, inventory_id))
+        conn.commit()
+        return cursor.rowcount > 0
+
+def delete_inventory_item(inventory_id):
+    """Delete inventory item"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM inventory WHERE inventory_id = ?', (inventory_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+def use_inventory_item(inventory_id, quantity_used):
+    """Decrease inventory quantity when item is used"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE inventory 
+            SET quantity = MAX(0, quantity - ?)
+            WHERE inventory_id = ?
+        ''', (quantity_used, inventory_id))
+        conn.commit()
+        return cursor.rowcount > 0
+
+def get_inventory_summary(user_id):
+    """Get inventory summary statistics"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT 
+                COUNT(*) as total_items,
+                SUM(quantity) as total_quantity,
+                SUM(CASE WHEN quantity <= min_quantity AND quantity > 0 THEN 1 ELSE 0 END) as low_stock_count,
+                SUM(CASE WHEN quantity = 0 THEN 1 ELSE 0 END) as out_of_stock_count,
+                SUM(CASE WHEN expiry_date IS NOT NULL AND expiry_date <= date('now', '+7 days') AND expiry_date >= date('now') THEN 1 ELSE 0 END) as expiring_soon_count,
+                SUM(CASE WHEN expiry_date IS NOT NULL AND expiry_date < date('now') THEN 1 ELSE 0 END) as expired_count
+            FROM inventory
+            WHERE user_id = ?
+        ''', (user_id,))
+        return cursor.fetchone()
+
+def get_inventory_by_location(user_id):
+    """Get inventory grouped by location"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT location, COUNT(*) as item_count, SUM(quantity) as total_quantity
+            FROM inventory
+            WHERE user_id = ? AND quantity > 0
+            GROUP BY location
+            ORDER BY item_count DESC
+        ''', (user_id,))
+        return cursor.fetchall()
+
+def get_inventory_by_category(user_id):
+    """Get inventory grouped by category"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT c.category_name, COUNT(*) as item_count, SUM(i.quantity) as total_quantity
+            FROM inventory i
+            JOIN products p ON i.product_id = p.product_id
+            JOIN categories c ON p.category_id = c.category_id
+            WHERE i.user_id = ? AND i.quantity > 0
+            GROUP BY c.category_id
+            ORDER BY item_count DESC
+        ''', (user_id,))
+        return cursor.fetchall()
 
 def get_suggested_products(user_id, limit=5):
     """Get suggested products based on purchase history"""
